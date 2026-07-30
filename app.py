@@ -39,7 +39,6 @@ st.markdown(
         padding: 10px;
         font-size: 16px;
     }
-    .stTextInput>div>div>input { border-radius: 8px; }
     </style>
 """,
     unsafe_allow_html=True,
@@ -47,20 +46,16 @@ st.markdown(
 
 st.markdown("<h1>🛒 Tool lên đơn (AI Thông Minh)</h1>", unsafe_allow_html=True)
 st.write(
-    "<p style='text-align: center; color: #555;'>Sử dụng AI Google Gemini để đọc ảnh cực chuẩn, tự động sửa lỗi chính tả và chuẩn hóa dữ liệu.</p>",
+    "<p style='text-align: center; color: #555;'>Sử dụng AI Google Gemini để đọc ảnh cực chuẩn, tự động phân loại theo từng ảnh và chuẩn hóa dữ liệu.</p>",
     unsafe_allow_html=True,
 )
 
-# Nhập API Key của Gemini
-api_key = st.text_input(
-    "🔑 Nhập Google Gemini API Key của bạn:",
-    type="password",
-    placeholder="Dán API Key vào đây...",
-)
+# Tích hợp sẵn API Key trực tiếp vào code
+API_KEY = "AIzaSyDl1p0krbXrDmnzFIyd0oSAHVjowM3KtEg"
 
-# Chọn file ảnh (Hỗ trợ chụp trực tiếp trên điện thoại/máy tính)
+# Cho phép chọn nhiều ảnh một lúc
 uploaded_files = st.file_uploader(
-    "📷 Tải lên hoặc chụp ảnh hóa đơn/danh sách (chọn 1 hoặc nhiều file):",
+    "📷 Tải lên hoặc chọn nhiều ảnh hóa đơn/danh sách cùng lúc:",
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
 )
@@ -120,19 +115,20 @@ def process_unit(row):
   if not unit or unit.lower() == "nan" or unit == "":
     return "Kg"
 
-  # Viết thường và viết hoa chữ cái đầu cho đơn vị tính
   return unit.lower().capitalize()
 
 
-if uploaded_files and api_key:
+if uploaded_files:
   if st.button("🚀 Tiến hành quét AI và chuẩn hóa"):
-    with st.spinner("🤖 AI đang đọc ảnh, tự động sửa lỗi chính tả..."):
+    with st.spinner("🤖 AI đang đọc toàn bộ ảnh, tự động phân nhóm và chuẩn hóa..."):
       try:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=API_KEY)
         all_data = []
 
+        # Lần lượt đọc từng ảnh trong danh sách các ảnh đã chọn
         for uploaded_file in uploaded_files:
           image = Image.open(uploaded_file)
+          image_name = uploaded_file.name  # Lấy tên file ảnh để phân biệt
 
           prompt = """
                     Bạn là một trợ lý kế toán chuyên nghiệp. Hãy đọc toàn bộ nội dung ảnh hóa đơn/danh sách hàng hóa này, tự động sửa mọi lỗi chính tả do hình ảnh mờ hoặc viết tay, và trích xuất danh sách các mặt hàng thành định dạng JSON chuẩn gồm các trường sau cho mỗi dòng:
@@ -158,7 +154,11 @@ if uploaded_files and api_key:
             text_res = text_res[3:-3].strip()
 
           items = json.loads(text_res)
-          all_data.extend(items)
+
+          # Gắn thêm tên ảnh vào từng dòng dữ liệu để phân biệt
+          for item in items:
+            item["ten_anh"] = image_name
+            all_data.append(item)
 
         df = pd.DataFrame(all_data)
 
@@ -169,7 +169,19 @@ if uploaded_files and api_key:
         df["don_gia"] = df["don_gia"].apply(format_number)
         df["thanh_tien"] = df["thanh_tien"].apply(format_number)
 
+        # Sắp xếp lại thứ tự cột, đưa Tên ảnh lên đầu tiên
+        df = df[
+            [
+                "ten_anh",
+                "ten_hang",
+                "don_vi_tinh",
+                "so_luong",
+                "don_gia",
+                "thanh_tien",
+            ]
+        ]
         df.columns = [
+            "Tên ảnh",
             "Tên hàng",
             "Đơn vị tính",
             "Số lượng",
@@ -177,7 +189,7 @@ if uploaded_files and api_key:
             "Thành tiền",
         ]
 
-        st.success("🎉 Quét ảnh và chuẩn hóa thành công!")
+        st.success("🎉 Quét hàng loạt ảnh và chuẩn hóa thành công!")
         st.dataframe(df, use_container_width=True)
 
         output = io.BytesIO()
@@ -186,14 +198,14 @@ if uploaded_files and api_key:
         excel_data = output.getvalue()
 
         st.download_button(
-            label="📥 Tải xuống file Excel (.xlsx)",
+            label="📥 Tải xuống file Excel tổng hợp (.xlsx)",
             data=excel_data,
-            file_name="tool_len_don_ai.xlsx",
+            file_name="tool_len_don_tong_hop.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
       except Exception as e:
         st.error(f"Đã có lỗi xảy ra: {e}")
 
-elif not api_key and uploaded_files:
-  st.warning("⚠️ Vui lòng nhập Google Gemini API Key ở ô phía trên để tiếp tục.")
+else:
+  st.info("💡 Vui lòng chọn một hoặc nhiều ảnh hóa đơn để bắt đầu.")
