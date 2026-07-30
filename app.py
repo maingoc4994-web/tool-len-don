@@ -50,8 +50,14 @@ st.write(
     unsafe_allow_html=True,
 )
 
-# Tích hợp sẵn API Key trực tiếp vào code
-API_KEY = "AIzaSyDl1p0krbXrDmnzFIyd0oSAHVjowM3KtEg"
+# Lấy API Key bảo mật từ Streamlit Secrets (An toàn tuyệt đối)
+try:
+  API_KEY = st.secrets["GEMINI_API_KEY"]
+except Exception:
+  st.error(
+      "⚠️ Chưa cấu hình GEMINI_API_KEY trong mục Secrets của Streamlit Cloud!"
+  )
+  st.stop()
 
 # Cho phép chọn nhiều ảnh một lúc
 uploaded_files = st.file_uploader(
