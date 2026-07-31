@@ -46,7 +46,7 @@ st.markdown(
 
 st.markdown("<h1>🛒 Tool lên đơn (AI Thông Minh)</h1>", unsafe_allow_html=True)
 st.write(
-    "<p style='text-align: center; color: #555;'>Sử dụng AI Google Gemini để đọc ảnh cực chuẩn, tự động phân loại theo từng ảnh và chuẩn hóa dữ liệu.</p>",
+    "<p style='text-align: center; color: #555;'>Sử dụng AI Google Gemini đọc ảnh theo lô tối ưu, tự động phân loại và chuẩn hóa dữ liệu hàng loạt.</p>",
     unsafe_allow_html=True,
 )
 
@@ -125,19 +125,33 @@ def process_unit(row):
 
 
 if uploaded_files:
-  if st.button("🚀 Tiến hành quét AI và chuẩn hóa"):
-    with st.spinner("🤖 AI đang đọc toàn bộ ảnh, tự động phân nhóm và chuẩn hóa..."):
+  if st.button("🚀 Tiến hành quét AI và chuẩn hóa hàng loạt"):
+    with st.spinner(
+        "🤖 AI đang xử lý theo lô ảnh để tối ưu hạn mức và tốc độ..."
+    ):
       try:
         client = genai.Client(api_key=API_KEY)
         all_data = []
 
-        # Lần lượt đọc từng ảnh trong danh sách các ảnh đã chọn
-        for uploaded_file in uploaded_files:
-          image = Image.open(uploaded_file)
-          image_name = uploaded_file.name  # Lấy tên file ảnh để phân biệt
+        # Chia danh sách ảnh thành các nhóm (lô) tối đa 5 ảnh mỗi lần gọi để tránh quá tải
+        batch_size = 5
+        file_chunks = [
+            uploaded_files[i : i + batch_size]
+            for i in range(0, len(uploaded_files), batch_size)
+        ]
 
-          prompt = """
-                    Bạn là một trợ lý kế toán chuyên nghiệp. Hãy đọc toàn bộ nội dung ảnh hóa đơn/danh sách hàng hóa này, tự động sửa mọi lỗi chính tả do hình ảnh mờ hoặc viết tay, và trích xuất danh sách các mặt hàng thành định dạng JSON chuẩn gồm các trường sau cho mỗi dòng:
+        for chunk in file_chunks:
+          images = []
+          file_names = []
+          for uploaded_file in chunk:
+            images.append(Image.open(uploaded_file))
+            file_names.append(uploaded_file.name)
+
+          prompt = f"""
+                    Bạn là một trợ lý kế toán chuyên nghiệp. Dưới đây là {len(chunk)} ảnh hóa đơn/danh sách hàng hóa. Tên các file ảnh lần lượt theo đúng thứ tự là: {file_names}.
+                    Hãy đọc nội dung từng ảnh, tự động sửa mọi lỗi chính tả do hình ảnh mờ hoặc viết tay, và trích xuất danh sách các mặt hàng cho TỪNG ảnh tương ứng.
+                    Trả về định dạng JSON chuẩn là một mảng các đối tượng, trong đó mỗi đối tượng bắt buộc phải có trường "ten_anh" ứng với tên file ảnh chính xác chứa mặt hàng đó, cùng các trường sau:
+                    - ten_anh: Tên file ảnh tương ứng của mặt hàng
                     - ten_hang: Tên hàng hóa (tự động sửa chính tả tiếng Việt cho chuẩn xác)
                     - don_vi_tinh: Đơn vị tính có trong ảnh (nếu không có thì để trống chuỗi "")
                     - so_luong: Số lượng (dạng số)
@@ -146,11 +160,11 @@ if uploaded_files:
                     
                     Chỉ trả về cấu trúc JSON thuần túy, tuyệt đối không kèm Markdown hay văn bản giải thích nào khác.
                     Cấu trúc mẫu:
-                    [{"ten_hang": "...", "don_vi_tinh": "...", "so_luong": 0, "don_gia": 0, "thanh_tien": 0}]
+                    [{"ten_anh": "{file_names[0]}", "ten_hang": "...", "don_vi_tinh": "...", "so_luong": 0, "don_gia": 0, "thanh_tien": 0}]
                     """
 
           response = client.models.generate_content(
-              model="gemini-3-flash-preview", contents=[image, prompt]
+              model="gemini-3-flash-preview", contents=images + [prompt]
           )
 
           text_res = response.text.strip()
@@ -160,10 +174,7 @@ if uploaded_files:
             text_res = text_res[3:-3].strip()
 
           items = json.loads(text_res)
-
-          # Gắn thêm tên ảnh vào từng dòng dữ liệu để phân biệt
           for item in items:
-            item["ten_anh"] = image_name
             all_data.append(item)
 
         df = pd.DataFrame(all_data)
@@ -195,7 +206,9 @@ if uploaded_files:
             "Thành tiền",
         ]
 
-        st.success("🎉 Quét hàng loạt ảnh và chuẩn hóa thành công!")
+        st.success(
+            "🎉 Quét hàng loạt ảnh theo lô và chuẩn hóa thành công!"
+        )
         st.dataframe(df, use_container_width=True)
 
         output = io.BytesIO()
