@@ -84,11 +84,18 @@ def process_item_name(name):
   """Quy tắc Tên hàng:
 
   - Bỏ hoàn toàn chữ 'Total' (không phân biệt hoa thường).
+  - Xóa phần '/...' phía sau nếu là chữ tiếng Anh.
   - Viết hoa chữ cái đầu mỗi từ, sửa lỗi chính tả chuẩn hóa.
   """
   if not name:
     return ""
+
+  # Bỏ chữ Total
   name = re.sub(r"(?i)\btotal\b", "", name).strip()
+
+  # Xóa phần từ dấu '/' trở đi nếu phần sau chứa chữ tiếng Anh
+  name = re.sub(r"\s*/\s*[a-zA-Z].*$", "", name).strip()
+
   name = re.sub(r"\s+", " ", name)
 
   words = name.split()
@@ -160,7 +167,7 @@ if uploaded_files:
                     
                     Chỉ trả về cấu trúc JSON thuần túy, tuyệt đối không kèm Markdown hay văn bản giải thích nào khác.
                     Cấu trúc mẫu:
-                    [{"ten_anh": "{file_names[0]}", "ten_hang": "...", "don_vi_tinh": "...", "so_luong": 0, "don_gia": 0, "thanh_tien": 0}]
+                    [{{"ten_anh": "{file_names[0]}", "ten_hang": "...", "don_vi_tinh": "...", "so_luong": 0, "don_gia": 0, "thanh_tien": 0}}]
                     """
 
           response = client.models.generate_content(
