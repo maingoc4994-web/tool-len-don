@@ -1,5 +1,5 @@
 streamlit
-pillow
 google-genai
 pandas
 openpyxl
+Pillow
