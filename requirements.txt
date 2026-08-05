@@ -1,4 +1,5 @@
 streamlit
+starlette==0.37.2
 google-genai
 pandas
 openpyxl
