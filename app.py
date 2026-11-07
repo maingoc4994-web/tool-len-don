@@ -65,7 +65,17 @@ uploaded_files = st.file_uploader(
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
 )
-
+st.markdown("---")
+    if st.button("🔍 Dò tìm tên Model chuẩn"):
+        try:
+            client = genai.Client(api_key=API_KEY)
+            models = client.models.list()
+            st.success("Dưới đây là các Model tài khoản của bạn được phép dùng:")
+            for m in models:
+                st.write(f"- `{m.name}`")
+        except Exception as e:
+            st.error(f"Lỗi khi dò tìm: {e}")
+    st.markdown("---")
 
 def format_number(val):
   """Định dạng số: dấu chấm (.) ngăn cách hàng nghìn, dấu phẩy (,) thập phân."""
