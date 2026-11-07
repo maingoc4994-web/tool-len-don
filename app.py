@@ -181,7 +181,7 @@ if uploaded_files:
                     """
 
           response = client.models.generate_content(
-              model="gemini-3-flash", contents=images + [prompt]
+              model="gemini-3.5-flash", contents=images + [prompt]
           )
 
           text_res = response.text.strip()
