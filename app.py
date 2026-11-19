@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import time
 import unicodedata
 from copy import copy
 from datetime import date, datetime
@@ -65,7 +66,7 @@ st.markdown(
 )
 
 # ==============================================================================
-# BẢO MẬT API KEY & HẰNG SỐ CẤU HÌNH
+# BẢO MẬT API KEY & DANH SÁCH MODEL DỰ PHÒNG
 # ==============================================================================
 try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
@@ -73,7 +74,11 @@ except Exception:
     st.error("⚠️ Chưa cấu hình GEMINI_API_KEY trong mục Secrets của Streamlit Cloud!")
     st.stop()
 
-MODEL_NAME = "gemini-3.5-flash"
+FALLBACK_MODELS = [
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
+]
 
 CUSTOMER_COLS = [
     "STT",
@@ -116,6 +121,54 @@ ABBREV_MAP = {
     "tt": "trung tam",
     "bt": "bao tang",
 }
+
+
+# ==============================================================================
+# HÀM GỌI GEMINI TỰ ĐỘNG THỬ LẠI & CHUYỂN MODEL DỰ PHÒNG
+# ==============================================================================
+def generate_with_fallback(client, contents, status_placeholder=None):
+    """Tự động thử lại khi gặp lỗi 503/429 và chuyển sang model dự phòng nếu vẫn bận."""
+    last_err = None
+    for idx, model_name in enumerate(FALLBACK_MODELS):
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                )
+                return response, model_name
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                is_overload = any(
+                    k in err_str
+                    for k in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")
+                )
+                is_not_found = "404" in err_str or "NOT_FOUND" in err_str
+
+                if is_not_found:
+                    if status_placeholder and idx < len(FALLBACK_MODELS) - 1:
+                        status_placeholder.info(
+                            f"🔄 Model `{model_name}` không khả dụng, chuyển sang `{FALLBACK_MODELS[idx + 1]}`..."
+                        )
+                    break
+
+                if is_overload:
+                    if attempt == 0:
+                        if status_placeholder:
+                            status_placeholder.info(
+                                f"⏳ `{model_name}` đang quá tải, tự thử lại sau 3 giây..."
+                            )
+                        time.sleep(3)
+                        continue
+                    if status_placeholder and idx < len(FALLBACK_MODELS) - 1:
+                        status_placeholder.info(
+                            f"🔄 `{model_name}` vẫn bận, tự chuyển sang `{FALLBACK_MODELS[idx + 1]}`..."
+                        )
+                    break
+
+                raise e
+    raise last_err
 
 
 # ==============================================================================
@@ -581,13 +634,15 @@ with st.expander("📂 File mẫu MTT & Danh sách khách hàng (tùy chọn t�
 
 
 # ==============================================================================
-# BƯỚC 2: QUÉT AI THEO LÔ (TỐI ĐA 5 ẢNH / LẦN GỌI)
+# BƯỚC 2: QUÉT AI THEO LÔ (TỰ ĐỘNG CHUYỂN MODEL DỰ PHÒNG KHI QUÁ TẢI)
 # ==============================================================================
 if uploaded_images:
     if st.button("🚀 Tiến hành quét AI và chuẩn hóa hàng loạt"):
+        status_box = st.empty()
         try:
             client = genai.Client(api_key=API_KEY)
             all_data = []
+            used_models = []
             batch_size = 5
             file_chunks = [
                 uploaded_images[i : i + batch_size]
@@ -625,10 +680,13 @@ Ví dụ cấu trúc:
 [{{"ten_anh": "{file_names[0]}", "ten_hang": "Táo đỏ", "don_vi_tinh": "Kg", "so_luong": 2.5, "don_gia": 45000, "thanh_tien": 112500}}]
 """
 
-                response = client.models.generate_content(
-                    model=MODEL_NAME,
+                response, used_model = generate_with_fallback(
+                    client=client,
                     contents=images + [prompt],
+                    status_placeholder=status_box,
                 )
+                if used_model not in used_models:
+                    used_models.append(used_model)
 
                 text_res = (response.text or "").strip()
                 if text_res.startswith("```json"):
@@ -644,6 +702,7 @@ Ví dụ cấu trúc:
                     all_data.extend(items)
 
             progress_bar.progress(1.0, text="✅ Hoàn tất quét tất cả các lô ảnh!")
+            status_box.empty()
 
             if not all_data:
                 st.warning("Không trích xuất được dòng hàng hóa nào từ các ảnh đã tải lên.")
@@ -677,23 +736,28 @@ Ví dụ cấu trúc:
                     new_map[img_name] = suggest_customer_code(img_name, df_kh_now)
                 st.session_state["image_customer_map"] = new_map
 
-                st.success(f"🎉 Đã quét xong {len(df_clean)} dòng hàng từ {df_clean['Tên ảnh'].nunique()} ảnh!")
+                model_note = f" (Model: {', '.join(used_models)})" if used_models else ""
+                st.success(
+                    f"🎉 Đã quét xong {len(df_clean)} dòng hàng từ "
+                    f"{df_clean['Tên ảnh'].nunique()} ảnh!{model_note}"
+                )
 
         except Exception as e:
+            status_box.empty()
             err_msg = str(e)
             if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
                 st.error(
-                    "⚠️ Đã chạm giới hạn lượt gọi miễn phí của Google Gemini (Lỗi 429). "
+                    "⚠️ Cả 3 model đều chạm giới hạn lượt gọi miễn phí (Lỗi 429). "
                     "Vui lòng chờ 1-2 phút rồi thử lại hoặc đổi API Key khác."
                 )
             elif "503" in err_msg or "UNAVAILABLE" in err_msg:
                 st.error(
-                    "⚠️ Máy chủ AI Google đang quá tải tạm thời (Lỗi 503). "
-                    "Bạn chỉ cần đợi khoảng 1-2 phút rồi bấm quét lại nhé!"
+                    "⚠️ Hệ thống AI Google (cả model chính và dự phòng) đều đang quá tải tạm thời (Lỗi 503). "
+                    "Bạn đợi khoảng 1-2 phút rồi bấm quét lại nhé!"
                 )
             elif "404" in err_msg or "NOT_FOUND" in err_msg:
                 st.error(
-                    f"⚠️ Không tìm thấy model `{MODEL_NAME}` (Lỗi 404). "
+                    "⚠️ Không tìm thấy model phù hợp (Lỗi 404). "
                     "Mở mục '⚙️ Công cụ kỹ thuật' ở cuối trang để kiểm tra danh sách model khả dụng."
                 )
             else:
