@@ -1,4 +1,5 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
 import json
 import os
@@ -15,7 +16,8 @@ import pandas as pd
 import requests
 import streamlit as st
 from google import genai
-from PIL import Image
+from google.genai import types
+from PIL import Image, ImageOps
 
 # ==============================================================================
 # CẤU HÌNH GIAO DIỆN TỐI ƯU ĐIỆN THOẠI (MOBILE-FIRST)
@@ -61,13 +63,13 @@ st.markdown(
 st.markdown("<h1>🍎 Tool Lên Hóa Đơn MTT (Trái Cây)</h1>", unsafe_allow_html=True)
 st.markdown(
     "<p style='text-align: center; color: #555; font-size: 0.95rem;'>"
-    "Quét ảnh đơn hàng bằng AI Gemini, tự động gợi ý khách hàng từ tên file, "
-    "gom đơn theo khách và xuất file Excel giá trị số thuần chuẩn MTT.</p>",
+    "Quét ảnh song song tốc độ cao bằng Gemini Lite, tự nén ảnh, gợi ý khách hàng từ tên file "
+    "và xuất file Excel giá trị số thuần chuẩn MTT.</p>",
     unsafe_allow_html=True,
 )
 
 # ==============================================================================
-# BẢO MẬT API KEY & DANH SÁCH MODEL DỰ PHÒNG
+# BẢO MẬT API KEY & CẤU HÌNH TỐC ĐỘ / MODEL
 # ==============================================================================
 try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
@@ -76,10 +78,15 @@ except Exception:
     st.stop()
 
 FALLBACK_MODELS = [
-    "gemini-3.5-flash",
-    "gemini-2.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
 ]
+
+BATCH_SIZE = 4         # Chia đều 12 ảnh thành 3 lô x 4 ảnh để chạy song song nhanh nhất
+MAX_WORKERS = 3        # Gửi tối đa 3 lô song song cùng lúc (tránh chạm giới hạn 429)
+MAX_IMAGE_SIDE = 1400  # Nén cạnh lớn nhất về 1400px (đủ nét đọc chữ, giảm 5-8 lần dung lượng)
+JPEG_QUALITY = 85
 
 CUSTOMER_COLS = [
     "STT",
@@ -149,7 +156,7 @@ ABBREV_MAP = {
 
 
 # ==============================================================================
-# TẠO FILE MẪU MTT TÍCH HỢP SẴN (KHÔNG CẦN TẢI FILE MẪU MỖI LẦN MỞ APP)
+# TẠO FILE MẪU MTT TÍCH HỢP SẴN
 # ==============================================================================
 def create_builtin_mtt_template() -> bytes:
     """Tạo file mẫu hóa đơn bán hàng MTT chuẩn 15 cột (sheet 'Hóa đơn bán hàng', dòng 1-8)."""
@@ -189,7 +196,6 @@ def create_builtin_mtt_template() -> bytes:
         c8.border = thin_border
         c8.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-        # Tạo định dạng chuẩn cho dòng 9 để sao chép xuống các dòng dữ liệu
         c9 = ws.cell(row=9, column=col_idx, value=None)
         c9.font = font_data
         c9.border = thin_border
@@ -206,19 +212,79 @@ def create_builtin_mtt_template() -> bytes:
 
 
 # ==============================================================================
-# HÀM GỌI GEMINI TỰ ĐỘNG THỬ LẠI & CHUYỂN MODEL DỰ PHÒNG
+# NÉN ẢNH & QUÉT AI SONG SONG THEO LÔ
 # ==============================================================================
-def generate_with_fallback(client, contents, status_placeholder=None):
-    """Tự động thử lại khi gặp lỗi 503/429 và chuyển sang model dự phòng nếu vẫn bận."""
+def compress_image_to_jpeg_bytes(file_bytes: bytes) -> bytes:
+    """Tự xoay đúng chiều ảnh chụp điện thoại, thu nhỏ tối đa 1400px và nén JPEG."""
+    with Image.open(io.BytesIO(file_bytes)) as img:
+        img = ImageOps.exif_transpose(img)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        img.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        return out.getvalue()
+
+
+def parse_json_array(raw_text: str):
+    text = (raw_text or "").strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+    data = json.loads(text)
+    return data if isinstance(data, list) else []
+
+
+def process_batch_worker(chunk_idx: int, chunk_payload: list, api_key: str):
+    """Chạy trong luồng song song: gửi 1 lô ảnh nén lên Gemini với fallback tự động.
+    chunk_payload: list các tuple (file_name, jpeg_bytes).
+    Không gọi lệnh giao diện st.* trong hàm này để đảm bảo an toàn luồng.
+    """
+    client = genai.Client(api_key=api_key)
+    file_names = [name for name, _ in chunk_payload]
+    image_parts = [
+        types.Part.from_bytes(data=jpg_bytes, mime_type="image/jpeg")
+        for _, jpg_bytes in chunk_payload
+    ]
+
+    # Bỏ trường thanh_tien khỏi JSON (Python tự tính) giúp AI phản hồi nhanh hơn ~20%
+    prompt = f"""
+Bạn là trợ lý kế toán hộ kinh doanh trái cây. Dưới đây là {len(file_names)} ảnh đơn hàng theo đúng thứ tự: {file_names}.
+Đọc từng ảnh, tự sửa lỗi chính tả tiếng Việt do ảnh mờ/viết tay, trích xuất mọi dòng mặt hàng của TỪNG ảnh.
+Bỏ qua các dòng tổng cộng (Total / Tổng cộng).
+
+Trả về duy nhất mảng JSON hợp lệ (không giải thích, không markdown). Mỗi phần tử gồm đúng 5 trường:
+- ten_anh: Tên file ảnh chính xác chứa mặt hàng đó
+- ten_hang: Tên mặt hàng tiếng Việt chuẩn xác
+- don_vi_tinh: Đơn vị tính trong ảnh (nếu không ghi để "")
+- so_luong: Số lượng dạng số
+- don_gia: Đơn giá dạng số
+
+Ví dụ:
+[{{"ten_anh": "{file_names[0]}", "ten_hang": "Táo đỏ", "don_vi_tinh": "Kg", "so_luong": 2.5, "don_gia": 45000}}]
+"""
+
+    contents = image_parts + [prompt]
+    config = types.GenerateContentConfig(
+        temperature=0.1,
+        response_mime_type="application/json",
+    )
+
     last_err = None
-    for idx, model_name in enumerate(FALLBACK_MODELS):
+    for model_name in FALLBACK_MODELS:
         for attempt in range(2):
             try:
                 response = client.models.generate_content(
                     model=model_name,
                     contents=contents,
+                    config=config,
                 )
-                return response, model_name
+                items = parse_json_array(response.text)
+                return chunk_idx, items, model_name
             except Exception as e:
                 last_err = e
                 err_str = str(e)
@@ -229,27 +295,14 @@ def generate_with_fallback(client, contents, status_placeholder=None):
                 is_not_found = "404" in err_str or "NOT_FOUND" in err_str
 
                 if is_not_found:
-                    if status_placeholder and idx < len(FALLBACK_MODELS) - 1:
-                        status_placeholder.info(
-                            f"🔄 Model `{model_name}` không khả dụng, chuyển sang `{FALLBACK_MODELS[idx + 1]}`..."
-                        )
                     break
-
                 if is_overload:
                     if attempt == 0:
-                        if status_placeholder:
-                            status_placeholder.info(
-                                f"⏳ `{model_name}` đang quá tải, tự thử lại sau 3 giây..."
-                            )
-                        time.sleep(3)
+                        time.sleep(2)
                         continue
-                    if status_placeholder and idx < len(FALLBACK_MODELS) - 1:
-                        status_placeholder.info(
-                            f"🔄 `{model_name}` vẫn bận, tự chuyển sang `{FALLBACK_MODELS[idx + 1]}`..."
-                        )
                     break
-
                 raise e
+
     raise last_err
 
 
@@ -525,15 +578,12 @@ def build_mtt_excel(
     sheet_name = "Hóa đơn bán hàng" if "Hóa đơn bán hàng" in wb.sheetnames else wb.sheetnames[0]
     ws = wb[sheet_name]
 
-    # Dọn sạch dataValidations và definedNames lỗi (nguyên nhân gây lỗi đọc cột C khi import)
     ws.data_validations.dataValidation.clear()
     wb.defined_names.clear()
 
-    # Đảm bảo dòng tiêu đề 8 khớp chính xác 15 cột chuẩn MTT
     for col_idx, header_text in enumerate(MTT_HEADERS, start=1):
         ws.cell(row=8, column=col_idx, value=header_text)
 
-    # Xóa sạch TẤT CẢ 15 cột (kể cả công thức cũ ở cột O) từ dòng 9 trở đi
     if ws.max_row > 9:
         ws.delete_rows(10, ws.max_row - 9)
     for c in range(1, 16):
@@ -541,7 +591,6 @@ def build_mtt_excel(
         cell.value = None
         cell.hyperlink = None
 
-    # Bảng tra cứu khách hàng theo Mã khách hàng
     kh_lookup = {}
     for _, r_kh in df_kh.iterrows():
         code = clean_str(r_kh.get("Mã khách hàng", ""))
@@ -748,7 +797,6 @@ repeat_buyer_info = st.checkbox(
     value=True,
 )
 
-# Kiểm tra trạng thái file mẫu & danh sách khách hàng
 local_tpl_path = find_existing_file(DEFAULT_TEMPLATE_PATHS, keyword="mau_hoa_don")
 kh_count = len(st.session_state["customers_df"])
 
@@ -786,7 +834,6 @@ with st.expander("📂 Tùy chọn nâng cao: Tải đè file mẫu MTT hoặc f
                 st.session_state["customers_df"] = load_customers_from_bytes(uploaded_kh_file.getvalue())
                 st.session_state["last_uploaded_kh_id"] = kh_file_id
                 st.session_state["customers_source_note"] = f"Nạp tạm từ `{uploaded_kh_file.name}`"
-                # Tự gợi ý lại khách hàng nếu đã quét ảnh trước đó
                 if st.session_state["scanned_df"] is not None:
                     new_map = {}
                     for img_name in st.session_state["scanned_df"]["Tên ảnh"].unique():
@@ -798,81 +845,68 @@ with st.expander("📂 Tùy chọn nâng cao: Tải đè file mẫu MTT hoặc f
 
 
 # ==============================================================================
-# BƯỚC 2: QUÉT AI THEO LÔ (TỰ ĐỘNG CHUYỂN MODEL DỰ PHÒNG KHI QUÁ TẢI)
+# BƯỚC 2: NÉN ẢNH & QUÉT AI SONG SONG CÁC LÔ
 # ==============================================================================
 if uploaded_images:
-    if st.button("🚀 Tiến hành quét AI và chuẩn hóa hàng loạt"):
-        status_box = st.empty()
+    if st.button("🚀 Tiến hành quét AI siêu tốc (chạy song song)"):
+        t_start = time.time()
         try:
-            client = genai.Client(api_key=API_KEY)
-            all_data = []
-            used_models = []
-            batch_size = 5
-            file_chunks = [
-                uploaded_images[i : i + batch_size]
-                for i in range(0, len(uploaded_images), batch_size)
+            total_imgs = len(uploaded_images)
+            progress_bar = st.progress(0.05, text=f"🗜️ Đang nén tối ưu {total_imgs} ảnh trước khi gửi AI...")
+
+            # Đọc và nén ảnh ở luồng chính (tránh lỗi đọc file đồng thời của Streamlit)
+            compressed_items = []
+            for f_img in uploaded_images:
+                raw_bytes = f_img.getvalue()
+                jpg_bytes = compress_image_to_jpeg_bytes(raw_bytes)
+                compressed_items.append((f_img.name, jpg_bytes))
+
+            chunks = [
+                compressed_items[i : i + BATCH_SIZE]
+                for i in range(0, len(compressed_items), BATCH_SIZE)
             ]
-            progress_bar = st.progress(0, text="🤖 Đang chuẩn bị quét ảnh...")
+            total_chunks = len(chunks)
+            workers = min(MAX_WORKERS, total_chunks)
 
-            for chunk_idx, chunk in enumerate(file_chunks):
-                progress_bar.progress(
-                    chunk_idx / len(file_chunks),
-                    text=f"🤖 Đang xử lý lô {chunk_idx + 1}/{len(file_chunks)} ({len(chunk)} ảnh)...",
-                )
-                images = []
-                file_names = []
-                for f_img in chunk:
-                    f_img.seek(0)
-                    images.append(Image.open(f_img))
-                    file_names.append(f_img.name)
+            progress_bar.progress(
+                0.20,
+                text=f"⚡ Đang gửi song song {total_chunks} lô ({total_imgs} ảnh) lên {FALLBACK_MODELS[0]}...",
+            )
 
-                prompt = f"""
-Bạn là trợ lý kế toán chuyên nghiệp cho hộ kinh doanh trái cây. Dưới đây là {len(chunk)} ảnh đơn hàng/hóa đơn.
-Tên các file ảnh theo đúng thứ tự là: {file_names}.
-Hãy đọc kỹ từng ảnh, tự động sửa lỗi chính tả tiếng Việt do ảnh mờ hoặc chữ viết tay, và trích xuất danh sách từng mặt hàng cho TỪNG ảnh.
-Bỏ qua các dòng tổng cộng (Total / Tổng cộng / Thành tiền tổng).
+            batch_results = {}
+            used_models = []
+            completed_count = 0
 
-Trả về duy nhất một mảng JSON hợp lệ (không có văn bản giải thích, không có markdown). Mỗi phần tử gồm các trường:
-- ten_anh: Tên file ảnh chính xác chứa mặt hàng đó
-- ten_hang: Tên mặt hàng tiếng Việt chuẩn xác
-- don_vi_tinh: Đơn vị tính ghi trong ảnh (nếu không ghi thì để chuỗi rỗng "")
-- so_luong: Số lượng dạng số (float hoặc int)
-- don_gia: Đơn giá dạng số (float hoặc int)
-- thanh_tien: Thành tiền dạng số (float hoặc int)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_map = {
+                    executor.submit(process_batch_worker, idx, chunk, API_KEY): idx
+                    for idx, chunk in enumerate(chunks)
+                }
+                for future in as_completed(future_map):
+                    c_idx, items, model_used = future.result()
+                    batch_results[c_idx] = items
+                    if model_used not in used_models:
+                        used_models.append(model_used)
+                    completed_count += 1
+                    pct = 0.20 + 0.75 * (completed_count / total_chunks)
+                    progress_bar.progress(
+                        pct,
+                        text=f"⚡ Đã xong {completed_count}/{total_chunks} lô...",
+                    )
 
-Ví dụ cấu trúc:
-[{{"ten_anh": "{file_names[0]}", "ten_hang": "Táo đỏ", "don_vi_tinh": "Kg", "so_luong": 2.5, "don_gia": 45000, "thanh_tien": 112500}}]
-"""
+            # Ghép kết quả đúng theo thứ tự lô ảnh ban đầu
+            all_data = []
+            for idx in range(total_chunks):
+                all_data.extend(batch_results.get(idx, []))
 
-                response, used_model = generate_with_fallback(
-                    client=client,
-                    contents=images + [prompt],
-                    status_placeholder=status_box,
-                )
-                if used_model not in used_models:
-                    used_models.append(used_model)
-
-                text_res = (response.text or "").strip()
-                if text_res.startswith("```json"):
-                    text_res = text_res[7:]
-                elif text_res.startswith("```"):
-                    text_res = text_res[3:]
-                if text_res.endswith("```"):
-                    text_res = text_res[:-3]
-                text_res = text_res.strip()
-
-                items = json.loads(text_res)
-                if isinstance(items, list):
-                    all_data.extend(items)
-
-            progress_bar.progress(1.0, text="✅ Hoàn tất quét tất cả các lô ảnh!")
-            status_box.empty()
+            elapsed = time.time() - t_start
+            progress_bar.progress(1.0, text=f"✅ Hoàn tất quét {total_imgs} ảnh trong {elapsed:.1f} giây!")
 
             if not all_data:
                 st.warning("Không trích xuất được dòng hàng hóa nào từ các ảnh đã tải lên.")
             else:
                 df_raw = pd.DataFrame(all_data)
-                for col in ["ten_anh", "ten_hang", "don_vi_tinh", "so_luong", "don_gia", "thanh_tien"]:
+                for col in ["ten_anh", "ten_hang", "don_vi_tinh", "so_luong", "don_gia"]:
                     if col not in df_raw.columns:
                         df_raw[col] = ""
 
@@ -899,18 +933,17 @@ Ví dụ cấu trúc:
                     new_map[img_name] = suggest_customer_code(img_name, df_kh_now)
                 st.session_state["image_customer_map"] = new_map
 
-                model_note = f" (Model: {', '.join(used_models)})" if used_models else ""
+                model_note = f" | Model: {', '.join(used_models)}" if used_models else ""
                 st.success(
-                    f"🎉 Đã quét xong {len(df_clean)} dòng hàng từ "
-                    f"{df_clean['Tên ảnh'].nunique()} ảnh!{model_note}"
+                    f"🎉 Quét xong {len(df_clean)} dòng hàng từ {df_clean['Tên ảnh'].nunique()} ảnh "
+                    f"trong **{elapsed:.1f} giây**!{model_note}"
                 )
 
         except Exception as e:
-            status_box.empty()
             err_msg = str(e)
             if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
                 st.error(
-                    "⚠️ Cả 3 model đều chạm giới hạn lượt gọi miễn phí (Lỗi 429). "
+                    "⚠️ Đã chạm giới hạn lượt gọi miễn phí của Google Gemini (Lỗi 429). "
                     "Vui lòng chờ 1-2 phút rồi thử lại hoặc đổi API Key khác."
                 )
             elif "503" in err_msg or "UNAVAILABLE" in err_msg:
