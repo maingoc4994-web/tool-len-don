@@ -10,6 +10,7 @@ from datetime import date, datetime
 from difflib import SequenceMatcher
 
 import openpyxl
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 import pandas as pd
 import requests
 import streamlit as st
@@ -61,7 +62,7 @@ st.markdown("<h1>🍎 Tool Lên Hóa Đơn MTT (Trái Cây)</h1>", unsafe_allow_
 st.markdown(
     "<p style='text-align: center; color: #555; font-size: 0.95rem;'>"
     "Quét ảnh đơn hàng bằng AI Gemini, tự động gợi ý khách hàng từ tên file, "
-    "gom đơn theo khách và xuất đúng mẫu hóa đơn máy tính tiền (MTT).</p>",
+    "gom đơn theo khách và xuất file Excel giá trị số thuần chuẩn MTT.</p>",
     unsafe_allow_html=True,
 )
 
@@ -108,6 +109,30 @@ DEFAULT_TEMPLATE_PATHS = [
     "Mau_hoa_don_ban_hang_MTT.xls",
 ]
 
+MTT_HEADERS = [
+    "Số thứ tự hóa đơn (*)",
+    "Ngày hóa đơn",
+    "Tên đơn vị mua hàng",
+    "Mã số thuế",
+    "Địa chỉ",
+    "Người mua hàng",
+    "Email",
+    "Số điện thoại",
+    "Căn cước công dân",
+    "Hình thức thanh toán (*)",
+    "Tên hàng hóa/dịch vụ (*)",
+    "ĐVT",
+    "Số lượng",
+    "Đơn giá",
+    "Thành tiền",
+]
+
+MTT_COL_WIDTHS = [
+    23.15, 20.71, 30.70, 20.86, 30.01,
+    20.86, 30.70, 18.58, 21.43, 24.86,
+    25.71, 15.71, 15.71, 25.71, 25.71,
+]
+
 ABBREV_MAP = {
     "vp": "van phong",
     "ubnd": "uy ban nhan dan",
@@ -121,6 +146,63 @@ ABBREV_MAP = {
     "tt": "trung tam",
     "bt": "bao tang",
 }
+
+
+# ==============================================================================
+# TẠO FILE MẪU MTT TÍCH HỢP SẴN (KHÔNG CẦN TẢI FILE MẪU MỖI LẦN MỞ APP)
+# ==============================================================================
+def create_builtin_mtt_template() -> bytes:
+    """Tạo file mẫu hóa đơn bán hàng MTT chuẩn 15 cột (sheet 'Hóa đơn bán hàng', dòng 1-8)."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Hóa đơn bán hàng"
+
+    font_title = Font(name="Times New Roman", size=14, bold=True)
+    font_guide_bold = Font(name="Times New Roman", size=11, bold=True, italic=True)
+    font_guide = Font(name="Times New Roman", size=11, italic=True)
+    font_header = Font(name="Times New Roman", size=12, bold=True)
+    font_data = Font(name="Times New Roman", size=12)
+
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    thin_side = Side(style="thin", color="BFBFBF")
+    thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+    ws["A1"] = "File mẫu danh sách hóa đơn để nhập vào phần mềm "
+    ws["A1"].font = font_title
+    ws["A2"] = "Hướng dẫn:"
+    ws["A2"].font = font_guide_bold
+    ws["A3"] = "- Điền dữ liệu hóa đơn cần lập trên phần mềm vào các cột tương ứng trên file này"
+    ws["A4"] = "- Các cột có dấu (*) là những cột bắt buộc"
+    ws["A5"] = "- Nếu muốn nhập thêm thông tin khác, người dùng có thể tự thêm cột trên file này (VD: Mã khách hàng, Mã hàng, Tỷ lệ chiết khấu)"
+    ws["A6"] = "- Các dòng dữ liệu phía dưới chỉ là ví dụ minh họa"
+    for r in range(3, 7):
+        ws.cell(row=r, column=1).font = font_guide
+
+    ws.row_dimensions[8].height = 25
+    for col_idx, (title, width) in enumerate(zip(MTT_HEADERS, MTT_COL_WIDTHS), start=1):
+        col_letter = openpyxl.utils.get_column_letter(col_idx)
+        ws.column_dimensions[col_letter].width = width
+
+        c8 = ws.cell(row=8, column=col_idx, value=title)
+        c8.font = font_header
+        c8.fill = header_fill
+        c8.border = thin_border
+        c8.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        # Tạo định dạng chuẩn cho dòng 9 để sao chép xuống các dòng dữ liệu
+        c9 = ws.cell(row=9, column=col_idx, value=None)
+        c9.font = font_data
+        c9.border = thin_border
+        if col_idx in (13, 14, 15):
+            c9.alignment = Alignment(horizontal="right", vertical="center")
+        elif col_idx in (1, 2, 12):
+            c9.alignment = Alignment(horizontal="center", vertical="center")
+        else:
+            c9.alignment = Alignment(horizontal="left", vertical="center")
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 # ==============================================================================
@@ -185,7 +267,7 @@ def strip_accents(text: str) -> str:
 def clean_str(val) -> str:
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return ""
-    s = str(val).strip()
+    s = unicodedata.normalize("NFC", str(val)).strip()
     return "" if s.lower() == "nan" else s
 
 
@@ -222,8 +304,8 @@ def to_number(val, default=0.0):
 
 def clean_excel_num(val):
     num = to_number(val, 0.0)
-    if num == int(num):
-        return int(num)
+    if abs(num - round(num)) < 1e-9:
+        return int(round(num))
     return round(num, 4)
 
 
@@ -328,22 +410,27 @@ def suggest_customer_code(filename: str, df_kh: pd.DataFrame) -> str:
 
 
 # ==============================================================================
-# ĐỌC / LƯU DANH SÁCH KHÁCH HÀNG & FILE MẪU MTT
+# TỰ ĐỘNG DÒ & ĐỌC FILE TRONG KHO GITHUB
 # ==============================================================================
-def find_existing_file(candidates):
+def find_existing_file(candidates, keyword=None):
     for p in candidates:
         if os.path.exists(p):
             return p
+    if keyword:
+        try:
+            for fname in sorted(os.listdir(".")):
+                low = strip_accents(fname).lower()
+                if (low.endswith(".xlsx") or low.endswith(".xls")) and keyword in low:
+                    return fname
+        except Exception:
+            pass
     return None
 
 
 def load_customers_from_bytes(raw_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_excel(
-        io.BytesIO(raw_bytes),
-        sheet_name="Danh sách khách hàng",
-        header=3,
-        dtype=str,
-    )
+    xls = pd.ExcelFile(io.BytesIO(raw_bytes))
+    sheet = "Danh sách khách hàng" if "Danh sách khách hàng" in xls.sheet_names else xls.sheet_names[0]
+    df = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=sheet, header=3, dtype=str)
     for col in CUSTOMER_COLS:
         if col not in df.columns:
             df[col] = ""
@@ -380,7 +467,7 @@ def save_customers_to_github(xlsx_bytes: bytes, target_path: str = "Danh_sach_kh
     if not token or not repo:
         return False, "Chưa cấu hình GITHUB_TOKEN/GITHUB_REPO trong Secrets."
 
-    url = f"[https://api.github.com/repos/](https://api.github.com/repos/){repo}/contents/{target_path}"
+    url = f"https://api.github.com/repos/{repo}/contents/{target_path}"
     headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github.v3+json",
@@ -416,6 +503,9 @@ def copy_row_style(ws, src_row: int, dst_row: int, max_col: int = 15):
             dst_cell.number_format = src_cell.number_format
 
 
+# ==============================================================================
+# ĐỔ DỮ LIỆU VÀO MẪU MTT (GIÁ TRỊ SỐ THUẦN Ở CỘT O + ĐỦ CỘT C)
+# ==============================================================================
 def build_mtt_excel(
     template_bytes: bytes,
     items_df: pd.DataFrame,
@@ -424,19 +514,34 @@ def build_mtt_excel(
     invoice_date_str: str,
     payment_method: str,
     group_by_customer: bool = True,
-) -> bytes:
-    """Đổ dữ liệu vào file mẫu hóa đơn bán hàng MTT (sheet 'Hóa đơn bán hàng', từ dòng 9)."""
+    repeat_buyer_info: bool = True,
+):
+    """Xuất file Excel chuẩn mẫu MTT:
+    - Cột O ghi trực tiếp GIÁ TRỊ SỐ (không ghi công thức) để phần mềm hiển thị ngay.
+    - Dọn sạch dataValidation/definedName lỗi của openpyxl để không mất cột C.
+    - Trả về (bytes_excel, preview_df).
+    """
     wb = openpyxl.load_workbook(io.BytesIO(template_bytes))
     sheet_name = "Hóa đơn bán hàng" if "Hóa đơn bán hàng" in wb.sheetnames else wb.sheetnames[0]
     ws = wb[sheet_name]
 
-    # Xóa sạch dữ liệu ví dụ mẫu và hyperlink email cũ từ dòng 9 trở đi ở cột A..N
-    for r in range(9, max(ws.max_row + 1, 15)):
-        for c in range(1, 15):
-            cell = ws.cell(row=r, column=c)
-            cell.value = None
-            cell.hyperlink = None
+    # Dọn sạch dataValidations và definedNames lỗi (nguyên nhân gây lỗi đọc cột C khi import)
+    ws.data_validations.dataValidation.clear()
+    wb.defined_names.clear()
 
+    # Đảm bảo dòng tiêu đề 8 khớp chính xác 15 cột chuẩn MTT
+    for col_idx, header_text in enumerate(MTT_HEADERS, start=1):
+        ws.cell(row=8, column=col_idx, value=header_text)
+
+    # Xóa sạch TẤT CẢ 15 cột (kể cả công thức cũ ở cột O) từ dòng 9 trở đi
+    if ws.max_row > 9:
+        ws.delete_rows(10, ws.max_row - 9)
+    for c in range(1, 16):
+        cell = ws.cell(row=9, column=c)
+        cell.value = None
+        cell.hyperlink = None
+
+    # Bảng tra cứu khách hàng theo Mã khách hàng
     kh_lookup = {}
     for _, r_kh in df_kh.iterrows():
         code = clean_str(r_kh.get("Mã khách hàng", ""))
@@ -452,7 +557,6 @@ def build_mtt_excel(
 
     invoice_groups = []
     if group_by_customer:
-        # Gom các ảnh cùng 1 khách hàng thành 1 hóa đơn (giữ thứ tự xuất hiện đầu tiên)
         seen_keys = []
         grouped_rows = {}
         for _, row in working_df.iterrows():
@@ -466,7 +570,6 @@ def build_mtt_excel(
             rows_list = grouped_rows[key]
             invoice_groups.append((rows_list[0]["_ma_kh"], rows_list))
     else:
-        # Mỗi ảnh là 1 hóa đơn riêng
         seen_imgs = []
         grouped_rows = {}
         for _, row in working_df.iterrows():
@@ -479,7 +582,7 @@ def build_mtt_excel(
             rows_list = grouped_rows[img]
             invoice_groups.append((rows_list[0]["_ma_kh"], rows_list))
 
-    # Ghi dữ liệu bắt đầu từ dòng 9
+    preview_rows = []
     current_row = 9
     for inv_idx, (ma_kh, rows_list) in enumerate(invoice_groups, start=1):
         kh_info = kh_lookup.get(ma_kh, {})
@@ -495,73 +598,106 @@ def build_mtt_excel(
             if current_row > 9:
                 copy_row_style(ws, 9, current_row, max_col=15)
 
+            fill_buyer = repeat_buyer_info or (item_pos == 0)
+
             # Cột A: Số thứ tự hóa đơn (*)
             c_stt = ws.cell(row=current_row, column=1, value=str(inv_idx))
             c_stt.number_format = "@"
 
-            # Các cột B..J chỉ điền ở dòng đầu tiên của mỗi hóa đơn
-            if item_pos == 0:
-                text_fields = [
-                    (2, invoice_date_str),
-                    (3, ten_dv),
-                    (4, mst),
-                    (5, dia_chi),
-                    (6, nguoi_mua),
-                    (7, email),
-                    (8, sdt),
-                    (9, cccd),
-                    (10, payment_method),
-                ]
-                for col_i, val_str in text_fields:
-                    cell = ws.cell(row=current_row, column=col_i, value=val_str if val_str else None)
-                    cell.hyperlink = None
-                    cell.number_format = "@"
+            # Cột B..J: Thông tin chung hóa đơn & người mua
+            b_val = invoice_date_str if fill_buyer else ""
+            c_val = ten_dv if fill_buyer else ""
+            d_val = mst if fill_buyer else ""
+            e_val = dia_chi if fill_buyer else ""
+            f_val = nguoi_mua if fill_buyer else ""
+            g_val = email if fill_buyer else ""
+            h_val = sdt if fill_buyer else ""
+            i_val = cccd if fill_buyer else ""
+            j_val = payment_method if fill_buyer else ""
+
+            text_fields = [
+                (2, b_val),
+                (3, c_val),
+                (4, d_val),
+                (5, e_val),
+                (6, f_val),
+                (7, g_val),
+                (8, h_val),
+                (9, i_val),
+                (10, j_val),
+            ]
+            for col_i, val_str in text_fields:
+                cell = ws.cell(row=current_row, column=col_i, value=val_str if val_str else None)
+                cell.hyperlink = None
+                cell.number_format = "@"
 
             # Cột K: Tên hàng hóa/dịch vụ (*)
-            c_ten = ws.cell(row=current_row, column=11, value=clean_str(item["Tên hàng"]))
+            ten_hang = clean_str(item["Tên hàng"])
+            c_ten = ws.cell(row=current_row, column=11, value=ten_hang)
             c_ten.number_format = "@"
 
             # Cột L: ĐVT
-            c_dvt = ws.cell(row=current_row, column=12, value=clean_str(item["ĐVT"]))
+            dvt = clean_str(item["ĐVT"])
+            c_dvt = ws.cell(row=current_row, column=12, value=dvt)
             c_dvt.number_format = "@"
 
             # Cột M: Số lượng (kiểu số thuần)
-            c_sl = ws.cell(row=current_row, column=13, value=clean_excel_num(item["Số lượng"]))
+            sl_val = clean_excel_num(item["Số lượng"])
+            c_sl = ws.cell(row=current_row, column=13, value=sl_val)
             c_sl.number_format = "General"
 
             # Cột N: Đơn giá (kiểu số thuần)
-            c_dg = ws.cell(row=current_row, column=14, value=clean_excel_num(item["Đơn giá"]))
+            dg_val = clean_excel_num(item["Đơn giá"])
+            c_dg = ws.cell(row=current_row, column=14, value=dg_val)
             c_dg.number_format = "#,##0"
 
-            # Cột O: Thành tiền (bảo toàn công thức MTT)
-            c_tt = ws.cell(
-                row=current_row,
-                column=15,
-                value=f'=IF(N{current_row}<>"",M{current_row}*N{current_row},"")',
-            )
+            # Cột O: Thành tiền (GHI TRỰC TIẾP GIÁ TRỊ SỐ - KHÔNG DÙNG CÔNG THỨC)
+            tt_val = int(round(to_number(sl_val, 0.0) * to_number(dg_val, 0.0)))
+            c_tt = ws.cell(row=current_row, column=15, value=tt_val)
             c_tt.number_format = "#,##0"
 
+            preview_rows.append(
+                {
+                    "STT HĐ": str(inv_idx),
+                    "Ngày HĐ": b_val,
+                    "Tên đơn vị mua hàng (Cột C)": c_val,
+                    "MST": d_val,
+                    "Địa chỉ": e_val,
+                    "HTTT": j_val,
+                    "Tên hàng hóa": ten_hang,
+                    "ĐVT": dvt,
+                    "Số lượng": sl_val,
+                    "Đơn giá": dg_val,
+                    "Thành tiền (Cột O)": tt_val,
+                }
+            )
             current_row += 1
 
     out = io.BytesIO()
     wb.save(out)
-    return out.getvalue()
+    return out.getvalue(), pd.DataFrame(preview_rows)
 
 
 # ==============================================================================
-# KHỞI TẠO SESSION STATE
+# KHỞI TẠO SESSION STATE (TỰ NẠP KHÁCH HÀNG TỪ GITHUB NẾU CÓ)
 # ==============================================================================
 if "customers_df" not in st.session_state:
-    local_kh_path = find_existing_file(DEFAULT_CUSTOMER_PATHS)
+    local_kh_path = find_existing_file(DEFAULT_CUSTOMER_PATHS, keyword="khach")
     if local_kh_path:
         try:
             with open(local_kh_path, "rb") as f:
                 st.session_state["customers_df"] = load_customers_from_bytes(f.read())
+            st.session_state["customers_source_note"] = f"Tự động nạp từ kho GitHub (`{local_kh_path}`)"
         except Exception as e:
             st.warning(f"Không đọc được file khách hàng sẵn có ({local_kh_path}): {e}")
             st.session_state["customers_df"] = pd.DataFrame(columns=CUSTOMER_COLS)
+            st.session_state["customers_source_note"] = "Chưa có file khách hàng"
     else:
         st.session_state["customers_df"] = pd.DataFrame(columns=CUSTOMER_COLS)
+        st.session_state["customers_source_note"] = "Chưa đặt file khách hàng lên GitHub"
+
+if "last_uploaded_kh_id" not in st.session_state:
+    st.session_state["last_uploaded_kh_id"] = None
 
 if "customers_modified" not in st.session_state:
     st.session_state["customers_modified"] = False
@@ -607,30 +743,58 @@ group_mode = st.radio(
 )
 group_by_customer = group_mode.startswith("Gom")
 
-local_tpl_path = find_existing_file(DEFAULT_TEMPLATE_PATHS)
-with st.expander("📂 File mẫu MTT & Danh sách khách hàng (tùy chọn tải đè)"):
+repeat_buyer_info = st.checkbox(
+    "📋 Điền thông tin đơn vị mua hàng (Cột B–J) ở tất cả các dòng của hóa đơn (khuyên dùng để tránh mất Cột C khi import)",
+    value=True,
+)
+
+# Kiểm tra trạng thái file mẫu & danh sách khách hàng
+local_tpl_path = find_existing_file(DEFAULT_TEMPLATE_PATHS, keyword="mau_hoa_don")
+kh_count = len(st.session_state["customers_df"])
+
+if kh_count > 0:
+    st.caption(
+        f"✅ Mẫu MTT: **Tích hợp sẵn** | "
+        f"Danh sách khách hàng: **{kh_count} đơn vị** ({st.session_state['customers_source_note']})"
+    )
+else:
+    st.warning(
+        "⚠️ Chưa tìm thấy file `Danh_sach_khach_hang (2).xls` trong kho GitHub. "
+        "Bạn có thể tải file lên GitHub 1 lần duy nhất (không cần đính kèm lại) hoặc tải tạm ở mục bên dưới."
+    )
+
+with st.expander("📂 Tùy chọn nâng cao: Tải đè file mẫu MTT hoặc file khách hàng"):
     if local_tpl_path:
-        st.caption(f"✅ Đang dùng file mẫu sẵn có: `{local_tpl_path}`")
+        st.caption(f"Đang ưu tiên file mẫu trên GitHub: `{local_tpl_path}` (nếu không có sẽ dùng mẫu chuẩn tích hợp sẵn).")
     else:
-        st.warning("⚠️ Chưa tìm thấy file mẫu MTT trên GitHub. Vui lòng tải file mẫu lên bên dưới.")
+        st.caption("✅ Đang dùng **file mẫu MTT chuẩn 15 cột tích hợp sẵn trong code** (không cần tải thêm).")
     uploaded_template = st.file_uploader(
-        "Tải file mẫu hóa đơn MTT khác (.xls / .xlsx):",
+        "Tải file mẫu hóa đơn MTT khác (chỉ dùng khi muốn đổi mẫu):",
         type=["xls", "xlsx"],
         key="tpl_uploader",
     )
 
-    st.caption(f"📋 Đang có **{len(st.session_state['customers_df'])}** khách hàng trong hệ thống.")
     uploaded_kh_file = st.file_uploader(
         "Tải file Danh sách khách hàng khác (.xls / .xlsx):",
         type=["xls", "xlsx"],
         key="kh_uploader",
     )
     if uploaded_kh_file is not None:
-        try:
-            st.session_state["customers_df"] = load_customers_from_bytes(uploaded_kh_file.getvalue())
-            st.success(f"✅ Đã nạp {len(st.session_state['customers_df'])} khách hàng từ file vừa tải lên!")
-        except Exception as e:
-            st.error(f"Lỗi đọc file khách hàng: {e}")
+        kh_file_id = f"{uploaded_kh_file.name}_{uploaded_kh_file.size}"
+        if st.session_state["last_uploaded_kh_id"] != kh_file_id:
+            try:
+                st.session_state["customers_df"] = load_customers_from_bytes(uploaded_kh_file.getvalue())
+                st.session_state["last_uploaded_kh_id"] = kh_file_id
+                st.session_state["customers_source_note"] = f"Nạp tạm từ `{uploaded_kh_file.name}`"
+                # Tự gợi ý lại khách hàng nếu đã quét ảnh trước đó
+                if st.session_state["scanned_df"] is not None:
+                    new_map = {}
+                    for img_name in st.session_state["scanned_df"]["Tên ảnh"].unique():
+                        new_map[img_name] = suggest_customer_code(img_name, st.session_state["customers_df"])
+                    st.session_state["image_customer_map"] = new_map
+                st.success(f"✅ Đã nạp {len(st.session_state['customers_df'])} khách hàng!")
+            except Exception as e:
+                st.error(f"Lỗi đọc file khách hàng: {e}")
 
 
 # ==============================================================================
@@ -720,7 +884,7 @@ Ví dụ cấu trúc:
                     lambda r: process_unit(r["Tên hàng"], r["don_vi_tinh"], r["Đơn giá"]),
                     axis=1,
                 )
-                df_raw["Thành tiền"] = df_raw["Số lượng"] * df_raw["Đơn giá"]
+                df_raw["Thành tiền"] = (df_raw["Số lượng"] * df_raw["Đơn giá"]).round(0)
 
                 df_clean = df_raw[df_raw["Tên hàng"] != ""][
                     ["Tên ảnh", "Tên hàng", "ĐVT", "Số lượng", "Đơn giá", "Thành tiền"]
@@ -729,7 +893,6 @@ Ví dụ cấu trúc:
                 st.session_state["scan_id"] += 1
                 st.session_state["scanned_df"] = df_clean
 
-                # Tự động gợi ý khách hàng cho từng ảnh dựa trên tên file
                 df_kh_now = st.session_state["customers_df"]
                 new_map = {}
                 for img_name in df_clean["Tên ảnh"].unique():
@@ -773,7 +936,7 @@ if st.session_state["scanned_df"] is not None and not st.session_state["scanned_
 
     df_kh = st.session_state["customers_df"]
     kh_codes = [""] + df_kh["Mã khách hàng"].tolist()
-    kh_labels = {"": "-- Chưa chọn / Khách lẻ --"}
+    kh_labels = {"": "-- Chưa chọn (Cột C sẽ trống) --"}
     kh_info_map = {}
     for _, r_kh in df_kh.iterrows():
         code = clean_str(r_kh["Mã khách hàng"])
@@ -782,6 +945,7 @@ if st.session_state["scanned_df"] is not None and not st.session_state["scanned_
         kh_info_map[code] = r_kh.to_dict()
 
     unique_imgs = list(dict.fromkeys(st.session_state["scanned_df"]["Tên ảnh"].tolist()))
+    missing_kh_imgs = []
 
     for img_idx, img_name in enumerate(unique_imgs):
         current_code = st.session_state["image_customer_map"].get(img_name, "")
@@ -800,15 +964,20 @@ if st.session_state["scanned_df"] is not None and not st.session_state["scanned_
 
         if selected_code and selected_code in kh_info_map:
             info = kh_info_map[selected_code]
-            details = []
+            details = [f"**Tên ĐV (Cột C):** {info['Tên khách hàng']}"]
             if clean_str(info.get("MST/CCCD chủ hộ")):
                 details.append(f"**MST:** {info['MST/CCCD chủ hộ']}")
             if clean_str(info.get("Địa chỉ")):
                 details.append(f"**ĐC:** {info['Địa chỉ']}")
-            if clean_str(info.get("Người nhận HĐ")):
-                details.append(f"**Người mua:** {info['Người nhận HĐ']}")
-            if details:
-                st.caption(" | ".join(details))
+            st.caption(" | ".join(details))
+        else:
+            missing_kh_imgs.append(img_name)
+
+    if missing_kh_imgs:
+        st.warning(
+            f"⚠️ Có **{len(missing_kh_imgs)} ảnh** chưa chọn đơn vị mua hàng (`{', '.join(missing_kh_imgs)}`). "
+            "Nếu không chọn, Cột C (Tên đơn vị mua hàng) của các ảnh này sẽ để trống."
+        )
 
     with st.expander("➕ Thêm khách hàng mới vào danh sách"):
         with st.form("form_add_customer", clear_on_submit=True):
@@ -873,7 +1042,6 @@ if st.session_state["scanned_df"] is not None and not st.session_state["scanned_
                         st.success(f"✅ Đã thêm [{auto_code}] {new_ten.strip()}. {msg_gh}")
                     else:
                         st.success(f"✅ Đã thêm [{auto_code}] {new_ten.strip()} vào phiên làm việc hiện tại!")
-                        st.info("💡 Bấm nút tải danh sách khách hàng mới nhất bên dưới để cập nhật lên GitHub.")
                     st.rerun()
 
     if st.session_state["customers_modified"]:
@@ -898,7 +1066,7 @@ if st.session_state["scanned_df"] is not None and not st.session_state["scanned_
             "ĐVT": st.column_config.TextColumn("ĐVT"),
             "Số lượng": st.column_config.NumberColumn("Số lượng", format="%.2f"),
             "Đơn giá": st.column_config.NumberColumn("Đơn giá", format="%,.0f"),
-            "Thành tiền": st.column_config.NumberColumn("Thành tiền (tạm tính)", format="%,.0f", disabled=True),
+            "Thành tiền": st.column_config.NumberColumn("Thành tiền", format="%,.0f", disabled=True),
         },
         key=f"editor_items_{st.session_state['scan_id']}",
     )
@@ -906,58 +1074,53 @@ if st.session_state["scanned_df"] is not None and not st.session_state["scanned_
     calc_df = edited_df.copy()
     calc_df["Số lượng"] = calc_df["Số lượng"].apply(lambda x: to_number(x, 0.0))
     calc_df["Đơn giá"] = calc_df["Đơn giá"].apply(lambda x: to_number(x, 0.0))
-    calc_df["Thành tiền"] = calc_df["Số lượng"] * calc_df["Đơn giá"]
-    tong_tien = calc_df["Thành tiền"].sum()
-
-    if group_by_customer:
-        preview_keys = set()
-        for _, r in calc_df.iterrows():
-            if clean_str(r["Tên hàng"]):
-                m_kh = clean_str(st.session_state["image_customer_map"].get(clean_str(r["Tên ảnh"]), ""))
-                preview_keys.add(f"KH::{m_kh}" if m_kh else f"IMG::{clean_str(r['Tên ảnh'])}")
-        so_hd = len(preview_keys)
-    else:
-        so_hd = calc_df[calc_df["Tên hàng"].apply(clean_str) != ""]["Tên ảnh"].nunique()
-
-    st.info(f"📊 Dự kiến xuất **{so_hd} hóa đơn** | Tổng cộng: **{tong_tien:,.0f} đ** | Thanh toán: **{payment_method}**")
+    calc_df["Thành tiền"] = (calc_df["Số lượng"] * calc_df["Đơn giá"]).round(0)
 
     # ==========================================================================
-    # BƯỚC 4: XUẤT FILE EXCEL MẪU HÓA ĐƠN MTT
+    # BƯỚC 4: XEM TRƯỚC & XUẤT FILE EXCEL MẪU HÓA ĐƠN MTT
     # ==========================================================================
-    st.subheader("4️⃣ Xuất file Excel mẫu hóa đơn MTT")
+    st.markdown("---")
+    st.subheader("4️⃣ Kiểm tra trước & xuất file Excel MTT")
 
-    template_bytes = None
     if uploaded_template is not None:
         template_bytes = uploaded_template.getvalue()
     elif local_tpl_path is not None:
         with open(local_tpl_path, "rb") as f_tpl:
             template_bytes = f_tpl.read()
-
-    if template_bytes is None:
-        st.error(
-            "⚠️ Chưa có file mẫu hóa đơn MTT! Vui lòng đặt file `Mau_hoa_don_ban_hang_MTT_2.xls` "
-            "(hoặc `.xlsx`) lên GitHub hoặc tải lên ở mục '📂 File mẫu MTT' phía trên."
-        )
     else:
-        try:
-            mtt_bytes = build_mtt_excel(
-                template_bytes=template_bytes,
-                items_df=calc_df,
-                image_customer_map=st.session_state["image_customer_map"],
-                df_kh=st.session_state["customers_df"],
-                invoice_date_str=invoice_date.strftime("%d/%m/%Y"),
-                payment_method=payment_method,
-                group_by_customer=group_by_customer,
-            )
-            out_filename = f"Hoa_don_MTT_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-            st.download_button(
-                label="📥 Tải file Excel mẫu hóa đơn MTT (.xlsx)",
-                data=mtt_bytes,
-                file_name=out_filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-        except Exception as e:
-            st.error(f"Lỗi khi tạo file Excel mẫu MTT: {e}")
+        template_bytes = create_builtin_mtt_template()
+
+    try:
+        mtt_bytes, preview_df = build_mtt_excel(
+            template_bytes=template_bytes,
+            items_df=calc_df,
+            image_customer_map=st.session_state["image_customer_map"],
+            df_kh=st.session_state["customers_df"],
+            invoice_date_str=invoice_date.strftime("%d/%m/%Y"),
+            payment_method=payment_method,
+            group_by_customer=group_by_customer,
+            repeat_buyer_info=repeat_buyer_info,
+        )
+
+        so_hd = preview_df["STT HĐ"].nunique() if not preview_df.empty else 0
+        tong_tien = preview_df["Thành tiền (Cột O)"].sum() if not preview_df.empty else 0
+        st.info(
+            f"📊 Dự kiến xuất **{so_hd} hóa đơn** | **{len(preview_df)} dòng hàng** | "
+            f"Tổng tiền: **{tong_tien:,.0f} đ** | Thanh toán: **{payment_method}**"
+        )
+
+        with st.expander("👁️ Xem trước dữ liệu chuẩn MTT (kiểm tra Cột C & Cột O trước khi tải)", expanded=True):
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+        out_filename = f"Hoa_don_MTT_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        st.download_button(
+            label="📥 Tải file Excel mẫu hóa đơn MTT (.xlsx)",
+            data=mtt_bytes,
+            file_name=out_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as e:
+        st.error(f"Lỗi khi tạo file Excel mẫu MTT: {e}")
 
 elif not uploaded_images:
     st.info("💡 Chọn hoặc chụp một hay nhiều ảnh đơn hàng ở phía trên để bắt đầu.")
